@@ -33,7 +33,7 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("tts-inference")
 
-CANONICAL_SAMPLE_RATE = 22050
+CANONICAL_SAMPLE_RATE = 24000
 
 
 # ---------------------------------------------------------------------------
@@ -60,10 +60,9 @@ def clear_gpu_cache() -> None:
 
 
 def to_wav_bytes(wav_array: np.ndarray, source_rate: int, target_rate: int) -> bytes:
-    import scipy.signal
     if source_rate != target_rate:
-        num_samples = int(len(wav_array) * target_rate / source_rate)
-        wav_array = scipy.signal.resample(wav_array, num_samples)
+        import soxr
+        wav_array = soxr.resample(wav_array.astype(np.float64), source_rate, target_rate, quality="VHQ")
     if wav_array.dtype != np.int16:
         peak = np.abs(wav_array).max() if len(wav_array) > 0 else 0
         if peak <= 1.0:
@@ -97,7 +96,7 @@ try:
         logger.info(f"XTTS-v2 loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_xtts(model: object, text: str, voice_path: Optional[str]) -> bytes:
+    def _synthesize_xtts(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
         if voice_path:
             wav = model.tts(text=text, speaker_wav=voice_path, language="en")
         else:
@@ -121,10 +120,10 @@ try:
         logger.info(f"F5-TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_f5(model: object, text: str, voice_path: Optional[str]) -> bytes:
+    def _synthesize_f5(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
         wav, sr, _ = model.infer(
             ref_file=voice_path or "",
-            ref_text="",
+            ref_text=ref_text or "",
             gen_text=text,
         )
         return to_wav_bytes(np.array(wav), sr, CANONICAL_SAMPLE_RATE)
@@ -151,20 +150,20 @@ try:
         logger.info(f"Qwen3-TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str]) -> bytes:
+    def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
         if voice_path:
             wavs, sr = model.generate_voice_clone(
                 text=text,
                 language="English",
                 ref_audio=voice_path,
-                x_vector_only_mode=True,
+                x_vector_only_mode=False,
             )
         else:
             wavs, sr = model.generate_voice_clone(
                 text=text,
                 language="English",
                 ref_audio="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav",
-                x_vector_only_mode=True,
+                x_vector_only_mode=False,
             )
         wav_array = wavs[0] if isinstance(wavs, list) else wavs
         if hasattr(wav_array, 'cpu'):
@@ -188,7 +187,7 @@ try:
         logger.info(f"Orpheus TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_orpheus(model: object, text: str, voice_path: Optional[str]) -> bytes:
+    def _synthesize_orpheus(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
         # Orpheus uses preset voices, not reference audio cloning
         syn_tokens = model.generate_speech(prompt=text, voice="tara")
         all_audio = []
@@ -248,6 +247,7 @@ class SynthesizeRequest(BaseModel):
     text: str
     engine: str
     voice_audio_b64: Optional[str] = None
+    ref_text: Optional[str] = None  # Reference audio transcript (used by F5-TTS)
     sample_rate: int = CANONICAL_SAMPLE_RATE
 
 
@@ -316,7 +316,7 @@ async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
         async with lock:
             start = time.perf_counter()
             audio_bytes = await asyncio.wait_for(
-                asyncio.to_thread(synthesizer, model, req.text, voice_path),
+                asyncio.to_thread(synthesizer, model, req.text, voice_path, req.ref_text),
                 timeout=120.0,
             )
             synthesis_ms = (time.perf_counter() - start) * 1000
