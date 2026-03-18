@@ -19,10 +19,14 @@ dependencies = [
 ]
 
 [[tool.uv.index]]
-url = "https://download.pytorch.org/whl/cu126"
 name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu126" }
-torchaudio = { index = "pytorch-cu126" }
+torch = [
+  { index = "pytorch-cu126" },
+]
+torchaudio = [
+  { index = "pytorch-cu126" },
+]
