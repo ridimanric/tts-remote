@@ -1,0 +1,27 @@
+[project]
+name = "tts-server"
+version = "0.1.0"
+description = "TTS inference server for GPU deployment"
+requires-python = ">=3.12"
+dependencies = [
+    "aiohttp>=3.13.3",
+    "coqui-tts>=0.27.5",
+    "f5-tts>=1.1.17",
+    "fastapi>=0.135.1",
+    "numpy>=2.0",
+    "scipy>=1.17.1",
+    "soundfile>=0.13.1",
+    "soxr>=1.0.0",
+    "torch>=2.6.0",
+    "torchaudio>=2.6.0",
+    "transformers<5",
+    "uvicorn>=0.42.0",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu126"
+name = "pytorch-cu126"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
