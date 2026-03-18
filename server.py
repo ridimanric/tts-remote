@@ -151,20 +151,16 @@ try:
         return model
 
     def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
+        # ICL mode (x_vector_only_mode=False) requires ref_text; fall back to x-vector mode without it
+        use_xvector = not ref_text
+        clone_kwargs: dict = dict(text=text, language="English", x_vector_only_mode=use_xvector)
+        if not use_xvector:
+            clone_kwargs["ref_text"] = ref_text
         if voice_path:
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                language="English",
-                ref_audio=voice_path,
-                x_vector_only_mode=False,
-            )
+            clone_kwargs["ref_audio"] = voice_path
         else:
-            wavs, sr = model.generate_voice_clone(
-                text=text,
-                language="English",
-                ref_audio="https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav",
-                x_vector_only_mode=False,
-            )
+            clone_kwargs["ref_audio"] = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+        wavs, sr = model.generate_voice_clone(**clone_kwargs)
         wav_array = wavs[0] if isinstance(wavs, list) else wavs
         if hasattr(wav_array, 'cpu'):
             wav_array = wav_array.cpu().numpy()
