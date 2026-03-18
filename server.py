@@ -65,8 +65,10 @@ def to_wav_bytes(wav_array: np.ndarray, source_rate: int, target_rate: int) -> b
         wav_array = soxr.resample(wav_array.astype(np.float64), source_rate, target_rate, quality="VHQ")
     if wav_array.dtype != np.int16:
         peak = np.abs(wav_array).max() if len(wav_array) > 0 else 0
-        if peak <= 1.0:
-            wav_array = (wav_array * 32767).astype(np.int16)
+        if peak > 0 and peak <= 1.0:
+            wav_array = (wav_array / peak * 0.95 * 32767).astype(np.int16)
+        elif peak > 1.0:
+            wav_array = (wav_array / peak * 0.95 * 32767).astype(np.int16)
         else:
             wav_array = wav_array.astype(np.int16)
     buf = io.BytesIO()
