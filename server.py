@@ -98,7 +98,7 @@ try:
         logger.info(f"XTTS-v2 loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_xtts(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
+    def _synthesize_xtts(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
         if voice_path:
             wav = model.tts(text=text, speaker_wav=voice_path, language="en")
         else:
@@ -122,11 +122,17 @@ try:
         logger.info(f"F5-TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_f5(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
+    def _synthesize_f5(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
+        p = engine_params or {}
         wav, sr, _ = model.infer(
             ref_file=voice_path or "",
             ref_text=ref_text or "",
             gen_text=text,
+            nfe_step=p.get("nfe_step", 32),
+            cfg_strength=p.get("cfg_strength", 2),
+            sway_sampling_coef=p.get("sway_sampling_coef", -1),
+            speed=p.get("speed", 1.0),
+            seed=p.get("seed"),
         )
         return to_wav_bytes(np.array(wav), sr, CANONICAL_SAMPLE_RATE)
 
@@ -152,7 +158,8 @@ try:
         logger.info(f"Qwen3-TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
+    def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
+        p = engine_params or {}
         # ICL mode (x_vector_only_mode=False) requires ref_text; fall back to x-vector mode without it
         use_xvector = not ref_text
         clone_kwargs: dict = dict(text=text, language="English", x_vector_only_mode=use_xvector)
@@ -162,6 +169,10 @@ try:
             clone_kwargs["ref_audio"] = voice_path
         else:
             clone_kwargs["ref_audio"] = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+        # Pass generation kwargs
+        for k in ("temperature", "top_k", "top_p", "repetition_penalty", "subtalker_temperature", "subtalker_top_k", "subtalker_top_p"):
+            if k in p:
+                clone_kwargs[k] = p[k]
         wavs, sr = model.generate_voice_clone(**clone_kwargs)
         wav_array = wavs[0] if isinstance(wavs, list) else wavs
         if hasattr(wav_array, 'cpu'):
@@ -185,7 +196,7 @@ try:
         logger.info(f"Orpheus TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_orpheus(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None) -> bytes:
+    def _synthesize_orpheus(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
         # Orpheus uses preset voices, not reference audio cloning
         syn_tokens = model.generate_speech(prompt=text, voice="tara")
         all_audio = []
@@ -246,6 +257,7 @@ class SynthesizeRequest(BaseModel):
     engine: str
     voice_audio_b64: Optional[str] = None
     ref_text: Optional[str] = None  # Reference audio transcript (used by F5-TTS)
+    engine_params: Optional[dict] = None  # Engine-specific params (temperature, cfg_strength, etc.)
     sample_rate: int = CANONICAL_SAMPLE_RATE
 
 
@@ -314,7 +326,7 @@ async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
         async with lock:
             start = time.perf_counter()
             audio_bytes = await asyncio.wait_for(
-                asyncio.to_thread(synthesizer, model, req.text, voice_path, req.ref_text),
+                asyncio.to_thread(synthesizer, model, req.text, voice_path, req.ref_text, req.engine_params),
                 timeout=120.0,
             )
             synthesis_ms = (time.perf_counter() - start) * 1000
