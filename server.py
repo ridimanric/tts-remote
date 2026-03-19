@@ -158,11 +158,14 @@ try:
         logger.info(f"Qwen3-TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
+    # Tuned defaults from quality iteration (best: t=0.7, st=0.85 with ref_text)
+    QWEN3_DEFAULTS: dict = {"temperature": 0.7, "subtalker_temperature": 0.85}
+
     def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
-        p = engine_params or {}
+        p = {**QWEN3_DEFAULTS, **(engine_params or {})}
         # ICL mode (x_vector_only_mode=False) requires ref_text; fall back to x-vector mode without it
         use_xvector = not ref_text
-        clone_kwargs: dict = dict(text=text, language="English", x_vector_only_mode=use_xvector)
+        clone_kwargs: dict = dict(text=text, language=p.pop("language", "English"), x_vector_only_mode=use_xvector)
         if not use_xvector:
             clone_kwargs["ref_text"] = ref_text
         if voice_path:
