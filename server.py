@@ -22,6 +22,7 @@ import wave
 import time
 import base64
 import asyncio
+import hashlib
 import logging
 import tempfile
 from typing import Optional
@@ -255,10 +256,27 @@ def _get_engine(name: str) -> object:
 # API
 # ---------------------------------------------------------------------------
 
+class PrimeVoiceRequest(BaseModel):
+    voice_audio_b64: str
+    engine: str
+
+
+class PrimeVoiceResponse(BaseModel):
+    cache_key: str
+    size_bytes: int
+
+
+# In-memory voice cache: cache_key -> tmpfs file path
+_voice_cache: dict[str, str] = {}
+MAX_VOICE_CACHE_ENTRIES = 20
+MAX_VOICE_FILE_BYTES = 10 * 1024 * 1024  # 10MB per voice file
+
+
 class SynthesizeRequest(BaseModel):
     text: str
     engine: str
     voice_audio_b64: Optional[str] = None
+    voice_cache_key: Optional[str] = None  # Use cached voice instead of uploading WAV
     ref_text: Optional[str] = None  # Reference audio transcript (used by F5-TTS)
     engine_params: Optional[dict] = None  # Engine-specific params (temperature, cfg_strength, etc.)
     sample_rate: int = CANONICAL_SAMPLE_RATE
@@ -275,6 +293,16 @@ class SynthesizeResponse(BaseModel):
 app = FastAPI(title="TTS Inference Server")
 
 
+@app.on_event("shutdown")
+async def cleanup_voice_cache() -> None:
+    """Clean up cached voice files from /dev/shm on server shutdown."""
+    for path in _voice_cache.values():
+        if os.path.exists(path):
+            os.unlink(path)
+    _voice_cache.clear()
+    logger.info("Voice cache cleaned up")
+
+
 @app.get("/health")
 async def health() -> dict:
     return {
@@ -288,6 +316,49 @@ async def health() -> dict:
 @app.get("/engines")
 async def list_engines() -> dict:
     return {"available": list(LOADERS.keys()), "loaded": list(ENGINES.keys())}
+
+
+@app.post("/prime-voice", response_model=PrimeVoiceResponse)
+async def prime_voice(req: PrimeVoiceRequest) -> PrimeVoiceResponse:
+    """Upload a voice profile once. Returns a cache_key for subsequent /synthesize calls."""
+    try:
+        voice_bytes = base64.b64decode(req.voice_audio_b64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 audio: {e}")
+
+    # Size check
+    if len(voice_bytes) > MAX_VOICE_FILE_BYTES:
+        raise HTTPException(status_code=413, detail=f"Voice file too large ({len(voice_bytes)} bytes, max {MAX_VOICE_FILE_BYTES})")
+
+    # Validate WAV format
+    try:
+        with wave.open(io.BytesIO(voice_bytes), "rb") as wf:
+            if wf.getnchannels() not in (1, 2) or wf.getsampwidth() not in (1, 2, 4):
+                raise HTTPException(status_code=400, detail="Unsupported WAV format")
+    except wave.Error:
+        raise HTTPException(status_code=400, detail="Invalid WAV file")
+
+    cache_key = hashlib.sha256(voice_bytes).hexdigest()
+
+    if cache_key not in _voice_cache:
+        # Evict oldest entry if cache is full
+        if len(_voice_cache) >= MAX_VOICE_CACHE_ENTRIES:
+            oldest_key = next(iter(_voice_cache))
+            evicted_path = _voice_cache.pop(oldest_key)
+            if os.path.exists(evicted_path):
+                os.unlink(evicted_path)
+            logger.info(f"Voice cache full, evicted: {oldest_key}")
+
+        # Save to /dev/shm (tmpfs — RAM only, no disk persistence)
+        cache_path = f"/dev/shm/voice_cache_{cache_key[:16]}.wav"
+        with open(cache_path, "wb") as f:
+            f.write(voice_bytes)
+        _voice_cache[cache_key] = cache_path
+        logger.info(f"Voice profile cached: key={cache_key[:16]}..., size={len(voice_bytes)} bytes")
+    else:
+        logger.info(f"Voice profile already cached: key={cache_key[:16]}...")
+
+    return PrimeVoiceResponse(cache_key=cache_key, size_bytes=len(voice_bytes))
 
 
 @app.post("/synthesize", response_model=SynthesizeResponse)
@@ -311,10 +382,12 @@ async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
 
     lock = ENGINE_LOCKS[req.engine]
 
-    # Write voice profile to temp file if provided
+    # Resolve voice profile: prefer cache_key, fall back to inline b64
     voice_path: Optional[str] = None
     tmp_file = None
-    if req.voice_audio_b64:
+    if req.voice_cache_key and req.voice_cache_key in _voice_cache:
+        voice_path = _voice_cache[req.voice_cache_key]
+    elif req.voice_audio_b64:
         try:
             voice_bytes = base64.b64decode(req.voice_audio_b64)
             tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
