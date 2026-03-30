@@ -151,17 +151,13 @@ try:
         from qwen_tts import Qwen3TTSModel
         logger.info("Loading Qwen3-TTS...")
         start = time.perf_counter()
-        # Use flash_attention_2 if available for faster inference
+        # Use SDPA (PyTorch native FlashAttention v2 kernels) for faster inference
         load_kwargs: dict = {
             "device_map": "cuda:0",
             "dtype": torch.bfloat16,
+            "attn_implementation": "sdpa",
         }
-        try:
-            import flash_attn  # noqa: F401
-            load_kwargs["attn_implementation"] = "flash_attention_2"
-            logger.info("Qwen3-TTS: using flash_attention_2")
-        except ImportError:
-            logger.info("Qwen3-TTS: flash_attn not installed, using default attention")
+        logger.info("Qwen3-TTS: using SDPA (PyTorch native flash attention)")
         model = Qwen3TTSModel.from_pretrained(
             "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
             **load_kwargs,
