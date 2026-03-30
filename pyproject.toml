@@ -17,6 +17,7 @@ dependencies = [
     "transformers<5",
     "uvicorn>=0.42.0",
     "qwen-tts",
+    "faster-whisper>=1.1.0",
 ]
 
 [[tool.uv.index]]

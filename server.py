@@ -12,6 +12,7 @@ Setup (on GPU server):
     uv add f5-tts                        # F5-TTS
     uv pip install qwen-tts              # Qwen3-TTS
     uv pip install orpheus-speech        # Orpheus TTS
+    uv add faster-whisper                # STT (Whisper)
 
 Run:
     uv run python server.py
@@ -28,8 +29,14 @@ import tempfile
 from typing import Optional
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from starlette.responses import StreamingResponse
 from pydantic import BaseModel
+
+# STT (faster-whisper)
+_stt_model = None
+_stt_lock = asyncio.Lock()
+STT_MODEL_SIZE = os.getenv("STT_MODEL_SIZE", "small.en")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("tts-inference")
@@ -230,6 +237,16 @@ try:
     logger.info("Orpheus TTS engine: available")
 except ImportError:
     logger.info("Orpheus TTS engine: not installed (orpheus-speech missing)")
+
+
+def _get_stt_model() -> object:
+    global _stt_model
+    if _stt_model is None:
+        from faster_whisper import WhisperModel
+        logger.info(f"Loading STT model: {STT_MODEL_SIZE}")
+        _stt_model = WhisperModel(STT_MODEL_SIZE, device="cuda", compute_type="float16")
+        logger.info(f"STT model loaded: {STT_MODEL_SIZE}")
+    return _stt_model
 
 
 # ---------------------------------------------------------------------------
@@ -465,6 +482,105 @@ async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
     finally:
         if tmp_file and os.path.exists(tmp_file.name):
             os.unlink(tmp_file.name)
+
+
+@app.post("/synthesize-stream")
+async def synthesize_stream(req: SynthesizeRequest) -> StreamingResponse:
+    """Streaming synthesis: returns chunked raw PCM int16 frames."""
+    if not req.text or not req.text.strip():
+        raise HTTPException(status_code=400, detail="Empty text")
+
+    try:
+        model = await asyncio.wait_for(
+            asyncio.to_thread(_get_engine, req.engine),
+            timeout=300.0,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=500, detail=f"Engine '{req.engine}' load timed out")
+
+    lock = ENGINE_LOCKS[req.engine]
+
+    voice_path: Optional[str] = None
+    voice_prompt = None
+    tmp_file = None
+    if req.voice_cache_key and req.voice_cache_key in _voice_cache:
+        cache_entry = _voice_cache[req.voice_cache_key]
+        voice_path = cache_entry["path"]
+        voice_prompt = cache_entry.get("prompt")
+    elif req.voice_audio_b64:
+        try:
+            voice_bytes = base64.b64decode(req.voice_audio_b64)
+            tmp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_file.write(voice_bytes)
+            tmp_file.close()
+            voice_path = tmp_file.name
+        except Exception as e:
+            logger.warning(f"Voice profile decode failed: {e}")
+
+    async def generate_chunks():
+        """Run synthesis and yield PCM chunks."""
+        try:
+            synthesizer = SYNTHESIZERS[req.engine]
+            start = time.perf_counter()
+            async with lock:
+                audio_bytes = await asyncio.wait_for(
+                    asyncio.to_thread(synthesizer, model, req.text, voice_path, req.ref_text, req.engine_params, voice_prompt),
+                    timeout=120.0,
+                )
+            synthesis_ms = (time.perf_counter() - start) * 1000
+
+            # Extract raw PCM from WAV
+            with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
+                pcm_data = wf.readframes(wf.getnframes())
+
+            # Yield in chunks of 2400 samples (100ms at 24kHz)
+            chunk_size = 2400 * 2  # 2 bytes per int16 sample
+            for offset in range(0, len(pcm_data), chunk_size):
+                yield pcm_data[offset:offset + chunk_size]
+
+            logger.info(f"[{req.engine}] streamed {len(req.text)} chars in {synthesis_ms:.0f}ms, {len(pcm_data) // chunk_size + 1} chunks")
+        except Exception as e:
+            logger.error(f"Streaming synthesis failed: {e}", exc_info=True)
+        finally:
+            if tmp_file and os.path.exists(tmp_file.name):
+                os.unlink(tmp_file.name)
+
+    return StreamingResponse(
+        generate_chunks(),
+        media_type="application/octet-stream",
+        headers={"X-Engine": req.engine},
+    )
+
+
+@app.post("/transcribe")
+async def transcribe(request: Request) -> dict:
+    """Transcribe raw PCM audio (16kHz, 16-bit, mono) using GPU-accelerated Whisper."""
+    audio_bytes = await request.body()
+    if len(audio_bytes) < 16000:  # < 0.5s
+        return {"transcript": "", "inference_ms": 0.0}
+
+    audio_array = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+
+    def _run_transcribe(model, audio):
+        segments, info = model.transcribe(
+            audio, beam_size=5, no_speech_threshold=0.6, log_prob_threshold=-1.0,
+        )
+        return [s.text for s in segments if s.no_speech_prob <= 0.6]
+
+    async with _stt_lock:
+        start = time.perf_counter()
+        model = _get_stt_model()
+        parts = await asyncio.wait_for(
+            asyncio.to_thread(_run_transcribe, model, audio_array),
+            timeout=30.0,
+        )
+        inference_ms = (time.perf_counter() - start) * 1000
+
+    transcript = " ".join(parts).strip()
+    logger.info(f"[STT] {len(audio_bytes)} bytes -> \"{transcript}\" in {inference_ms:.0f}ms")
+    return {"transcript": transcript, "inference_ms": round(inference_ms, 1)}
 
 
 if __name__ == "__main__":
