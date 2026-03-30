@@ -99,7 +99,7 @@ try:
         logger.info(f"XTTS-v2 loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_xtts(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
+    def _synthesize_xtts(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None, voice_prompt: object = None) -> bytes:
         if voice_path:
             wav = model.tts(text=text, speaker_wav=voice_path, language="en")
         else:
@@ -123,7 +123,7 @@ try:
         logger.info(f"F5-TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_f5(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
+    def _synthesize_f5(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None, voice_prompt: object = None) -> bytes:
         p = engine_params or {}
         wav, sr, _ = model.infer(
             ref_file=voice_path or "",
@@ -151,10 +151,20 @@ try:
         from qwen_tts import Qwen3TTSModel
         logger.info("Loading Qwen3-TTS...")
         start = time.perf_counter()
+        # Use flash_attention_2 if available for faster inference
+        load_kwargs: dict = {
+            "device_map": "cuda:0",
+            "dtype": torch.bfloat16,
+        }
+        try:
+            import flash_attn  # noqa: F401
+            load_kwargs["attn_implementation"] = "flash_attention_2"
+            logger.info("Qwen3-TTS: using flash_attention_2")
+        except ImportError:
+            logger.info("Qwen3-TTS: flash_attn not installed, using default attention")
         model = Qwen3TTSModel.from_pretrained(
             "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-            device_map="cuda:0",
-            dtype=torch.bfloat16,
+            **load_kwargs,
         )
         logger.info(f"Qwen3-TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
@@ -162,17 +172,24 @@ try:
     # Tuned defaults from quality iteration (best: t=0.7, st=0.85 with ref_text)
     QWEN3_DEFAULTS: dict = {"temperature": 0.7, "subtalker_temperature": 0.85}
 
-    def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
+    def _synthesize_qwen3(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None, voice_prompt: object = None) -> bytes:
         p = {**QWEN3_DEFAULTS, **(engine_params or {})}
-        # ICL mode (x_vector_only_mode=False) requires ref_text; fall back to x-vector mode without it
-        use_xvector = not ref_text
-        clone_kwargs: dict = dict(text=text, language=p.pop("language", "English"), x_vector_only_mode=use_xvector)
-        if not use_xvector:
-            clone_kwargs["ref_text"] = ref_text
-        if voice_path:
-            clone_kwargs["ref_audio"] = voice_path
+        language = p.pop("language", "English")
+
+        # Use pre-extracted speaker embedding if available (skips per-call extraction)
+        if voice_prompt is not None:
+            clone_kwargs: dict = dict(text=text, language=language, voice_clone_prompt=voice_prompt)
         else:
-            clone_kwargs["ref_audio"] = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+            # Fall back to extracting from audio on every call
+            use_xvector = not ref_text
+            clone_kwargs: dict = dict(text=text, language=language, x_vector_only_mode=use_xvector)
+            if not use_xvector:
+                clone_kwargs["ref_text"] = ref_text
+            if voice_path:
+                clone_kwargs["ref_audio"] = voice_path
+            else:
+                clone_kwargs["ref_audio"] = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
+
         # Pass generation kwargs
         for k in ("temperature", "top_k", "top_p", "repetition_penalty", "subtalker_temperature", "subtalker_top_k", "subtalker_top_p"):
             if k in p:
@@ -200,7 +217,7 @@ try:
         logger.info(f"Orpheus TTS loaded in {(time.perf_counter() - start) * 1000:.0f}ms")
         return model
 
-    def _synthesize_orpheus(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None) -> bytes:
+    def _synthesize_orpheus(model: object, text: str, voice_path: Optional[str], ref_text: Optional[str] = None, engine_params: Optional[dict] = None, voice_prompt: object = None) -> bytes:
         # Orpheus uses preset voices, not reference audio cloning
         syn_tokens = model.generate_speech(prompt=text, voice="tara")
         all_audio = []
@@ -266,8 +283,8 @@ class PrimeVoiceResponse(BaseModel):
     size_bytes: int
 
 
-# In-memory voice cache: cache_key -> tmpfs file path
-_voice_cache: dict[str, str] = {}
+# In-memory voice cache: cache_key -> {"path": tmpfs_path, "prompt": pre-extracted voice_clone_prompt}
+_voice_cache: dict[str, dict] = {}
 MAX_VOICE_CACHE_ENTRIES = 20
 MAX_VOICE_FILE_BYTES = 10 * 1024 * 1024  # 10MB per voice file
 
@@ -296,7 +313,8 @@ app = FastAPI(title="TTS Inference Server")
 @app.on_event("shutdown")
 async def cleanup_voice_cache() -> None:
     """Clean up cached voice files from /dev/shm on server shutdown."""
-    for path in _voice_cache.values():
+    for entry in _voice_cache.values():
+        path = entry["path"] if isinstance(entry, dict) else entry
         if os.path.exists(path):
             os.unlink(path)
     _voice_cache.clear()
@@ -344,16 +362,38 @@ async def prime_voice(req: PrimeVoiceRequest) -> PrimeVoiceResponse:
         # Evict oldest entry if cache is full
         if len(_voice_cache) >= MAX_VOICE_CACHE_ENTRIES:
             oldest_key = next(iter(_voice_cache))
-            evicted_path = _voice_cache.pop(oldest_key)
-            if os.path.exists(evicted_path):
-                os.unlink(evicted_path)
-            logger.info(f"Voice cache full, evicted: {oldest_key}")
+            evicted = _voice_cache.pop(oldest_key)
+            if os.path.exists(evicted["path"]):
+                os.unlink(evicted["path"])
+            logger.info(f"Voice cache full, evicted: {oldest_key[:16]}...")
 
         # Save to /dev/shm (tmpfs — RAM only, no disk persistence)
         cache_path = f"/dev/shm/voice_cache_{cache_key[:16]}.wav"
         with open(cache_path, "wb") as f:
             f.write(voice_bytes)
-        _voice_cache[cache_key] = cache_path
+
+        cache_entry: dict = {"path": cache_path, "prompt": None}
+
+        # Pre-extract speaker embedding for Qwen3 (skips re-extraction per sentence)
+        if req.engine == "qwen3" and "qwen3" in LOADERS:
+            try:
+                model = await asyncio.wait_for(
+                    asyncio.to_thread(_get_engine, "qwen3"), timeout=300.0
+                )
+                logger.info(f"Pre-extracting Qwen3 speaker embedding for cache_key={cache_key[:16]}...")
+                start = time.perf_counter()
+                prompt_items = await asyncio.to_thread(
+                    model.create_voice_clone_prompt,
+                    ref_audio=cache_path,
+                    x_vector_only_mode=True,
+                )
+                extract_ms = (time.perf_counter() - start) * 1000
+                cache_entry["prompt"] = prompt_items
+                logger.info(f"Speaker embedding extracted in {extract_ms:.0f}ms")
+            except Exception as e:
+                logger.warning(f"Speaker embedding extraction failed (will extract per-call): {e}")
+
+        _voice_cache[cache_key] = cache_entry
         logger.info(f"Voice profile cached: key={cache_key[:16]}..., size={len(voice_bytes)} bytes")
     else:
         logger.info(f"Voice profile already cached: key={cache_key[:16]}...")
@@ -384,9 +424,12 @@ async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
 
     # Resolve voice profile: prefer cache_key, fall back to inline b64
     voice_path: Optional[str] = None
+    voice_prompt = None  # Pre-extracted speaker embedding (Qwen3)
     tmp_file = None
     if req.voice_cache_key and req.voice_cache_key in _voice_cache:
-        voice_path = _voice_cache[req.voice_cache_key]
+        cache_entry = _voice_cache[req.voice_cache_key]
+        voice_path = cache_entry["path"]
+        voice_prompt = cache_entry.get("prompt")
     elif req.voice_audio_b64:
         try:
             voice_bytes = base64.b64decode(req.voice_audio_b64)
@@ -402,7 +445,7 @@ async def synthesize(req: SynthesizeRequest) -> SynthesizeResponse:
         async with lock:
             start = time.perf_counter()
             audio_bytes = await asyncio.wait_for(
-                asyncio.to_thread(synthesizer, model, req.text, voice_path, req.ref_text, req.engine_params),
+                asyncio.to_thread(synthesizer, model, req.text, voice_path, req.ref_text, req.engine_params, voice_prompt),
                 timeout=120.0,
             )
             synthesis_ms = (time.perf_counter() - start) * 1000
