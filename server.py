@@ -289,6 +289,7 @@ def _get_engine(name: str) -> object:
 class PrimeVoiceRequest(BaseModel):
     voice_audio_b64: str
     engine: str
+    ref_text: Optional[str] = None
 
 
 class PrimeVoiceResponse(BaseModel):
@@ -393,16 +394,23 @@ async def prime_voice(req: PrimeVoiceRequest) -> PrimeVoiceResponse:
                 model = await asyncio.wait_for(
                     asyncio.to_thread(_get_engine, "qwen3"), timeout=300.0
                 )
-                logger.info(f"Pre-extracting Qwen3 speaker embedding for cache_key={cache_key[:16]}...")
+                use_xvector = not req.ref_text
+                mode_label = "x-vector only" if use_xvector else "ref_text-aware"
+                logger.info(f"Pre-extracting Qwen3 speaker embedding ({mode_label}) for cache_key={cache_key[:16]}...")
                 start = time.perf_counter()
+                extract_kwargs: dict = {
+                    "ref_audio": cache_path,
+                    "x_vector_only_mode": use_xvector,
+                }
+                if req.ref_text:
+                    extract_kwargs["ref_text"] = req.ref_text
                 prompt_items = await asyncio.to_thread(
                     model.create_voice_clone_prompt,
-                    ref_audio=cache_path,
-                    x_vector_only_mode=True,
+                    **extract_kwargs,
                 )
                 extract_ms = (time.perf_counter() - start) * 1000
                 cache_entry["prompt"] = prompt_items
-                logger.info(f"Speaker embedding extracted in {extract_ms:.0f}ms")
+                logger.info(f"Speaker embedding extracted in {extract_ms:.0f}ms ({mode_label})")
             except Exception as e:
                 logger.warning(f"Speaker embedding extraction failed (will extract per-call): {e}")
 
