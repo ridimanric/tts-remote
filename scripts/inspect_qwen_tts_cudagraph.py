@@ -82,17 +82,88 @@ def main() -> None:
     )
     print(f"target forward: {fwd_fn_qual}")
 
-    header("Step 2: hook forward to capture realistic single-step inputs")
+    header("Step 2a: enumerate submodules to find the per-decode-step forward")
 
-    original_forward = inner_model.forward
+    # Print top-level submodules to identify candidates (talker, code_predictor,
+    # speech_tokenizer, etc.).
+    print("  top-level submodules of inner_model:")
+    for name, sub in inner_model.named_children():
+        n_params = sum(p.numel() for p in sub.parameters())
+        print(f"    {name:30s}  {type(sub).__name__:30s}  params={n_params:>12,}")
+
+    # Register a forward hook on EVERY named module to record call counts during
+    # a short generate. The module called the most times during decode is the
+    # one we want to capture for the autoregressive loop.
+    call_counts: dict[str, int] = {}
+    handles: list[Any] = []
+
+    def make_counter(qualname: str) -> Any:
+        def hook(_module: Any, _args: tuple, _output: Any) -> None:
+            call_counts[qualname] = call_counts.get(qualname, 0) + 1
+        return hook
+
+    for name, sub in inner_model.named_modules():
+        if name == "":
+            continue
+        handles.append(sub.register_forward_hook(make_counter(name)))
+
+    try:
+        prompt = model.create_voice_clone_prompt(
+            ref_audio=REF_AUDIO,
+            ref_text=REF_TEXT,
+        )
+        print()
+        print("  running short generate to count per-module forward calls (max_new_tokens=8)...")
+        t0 = time.perf_counter()
+        _ = model.generate_voice_clone(
+            text=TEST_SENTENCE,
+            language="English",
+            voice_clone_prompt=prompt,
+            max_new_tokens=8,
+        )
+        gen_ms = (time.perf_counter() - t0) * 1000
+        print(f"  short generate finished in {gen_ms:.0f} ms")
+    finally:
+        for h in handles:
+            h.remove()
+
+    # Sort by call count, show top 20 most-called modules.
+    print()
+    print("  top 20 modules by forward-call count during 8-token generate:")
+    print(f"  {'count':>7}  module")
+    for qualname, count in sorted(call_counts.items(), key=lambda kv: -kv[1])[:20]:
+        print(f"  {count:>7d}  {qualname}")
+
+    # The "decode step" forward is typically the highest-level module that runs
+    # exactly once per generated token. With max_new_tokens=8 plus 1 prefill,
+    # we expect ~8-9 calls on the right module.
+    decode_candidates = [name for name, count in call_counts.items() if 7 <= count <= 12]
+    if not decode_candidates:
+        print()
+        print("  WARNING: no module matches expected per-step call count (7-12).")
+        print("  Cannot auto-identify the decode-step module.")
+        return
+
+    # Pick the LONGEST qualified name among candidates with the same count —
+    # that's the deepest module that fires per step (closer to the actual decoder).
+    # Actually we want the SHORTEST — that's the highest-level module per-step,
+    # which is a better capture target (encloses the whole step).
+    decode_candidates.sort(key=len)
+    decode_target_name = decode_candidates[0]
+    decode_target_count = call_counts[decode_target_name]
+    print()
+    print(f"  decode-step capture target: '{decode_target_name}' ({decode_target_count} calls)")
+    decode_target = dict(inner_model.named_modules())[decode_target_name]
+
+    header("Step 2b: hook the decode-step module to capture realistic inputs")
+
+    original_forward = decode_target.forward
 
     def hooking_forward(*args: Any, **kwargs: Any) -> Any:
         global _captured_args, _captured_kwargs, _capture_count
         _capture_count += 1
-        # Capture the SECOND step (first step is prefill with full prompt;
-        # we want a steady-state decode step).
+        # Capture the SECOND call (skip prefill / first step).
         if _capture_count == 2 and _captured_args is None:
-            # Detach + clone tensors to a clean copy we own.
             def _clone(x: Any) -> Any:
                 if isinstance(x, torch.Tensor):
                     return x.detach().clone()
@@ -103,7 +174,7 @@ def main() -> None:
                 return x
             _captured_args = _clone(args)
             _captured_kwargs = _clone(kwargs)
-            print(f"  captured step #{_capture_count} forward inputs")
+            print(f"  captured step #{_capture_count} forward inputs from '{decode_target_name}'")
             print(f"    args: {len(args)} positional")
             for i, a in enumerate(args):
                 if isinstance(a, torch.Tensor):
@@ -113,27 +184,23 @@ def main() -> None:
             print(f"    kwargs: {sorted(kwargs.keys())}")
         return original_forward(*args, **kwargs)
 
-    inner_model.forward = hooking_forward  # type: ignore[method-assign]
+    decode_target.forward = hooking_forward  # type: ignore[method-assign]
     try:
-        prompt = model.create_voice_clone_prompt(
-            ref_audio=REF_AUDIO,
-            ref_text=REF_TEXT,
-        )
-        print("running short generate to capture input shape (max_new_tokens=8)...")
+        print("  running short generate to capture step inputs (max_new_tokens=8)...")
         t0 = time.perf_counter()
-        wavs, sr = model.generate_voice_clone(
+        _ = model.generate_voice_clone(
             text=TEST_SENTENCE,
             language="English",
             voice_clone_prompt=prompt,
             max_new_tokens=8,
         )
         gen_ms = (time.perf_counter() - t0) * 1000
-        print(f"  short generate finished in {gen_ms:.0f} ms; total forward calls: {_capture_count}")
+        print(f"  short generate finished in {gen_ms:.0f} ms; total target calls: {_capture_count}")
     finally:
-        inner_model.forward = original_forward  # type: ignore[method-assign]
+        decode_target.forward = original_forward  # type: ignore[method-assign]
 
     if _captured_args is None:
-        print("ERROR: no forward inputs captured. The hook may have missed the call path.")
+        print("ERROR: hook on decode_target was not invoked. Cannot proceed.")
         return
 
     header("Step 3: replay one forward eagerly to establish reference output")
