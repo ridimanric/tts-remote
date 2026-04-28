@@ -16,8 +16,9 @@
 # Usage (from /workspace/tts-remote on the pod):
 #     bash scripts/install_flash_attn.sh
 #
-# Runs in the FOREGROUND. Build takes ~30-60 minutes at MAX_JOBS=4 depending
-# on which kernels are heaviest.
+# Runs in the FOREGROUND. Build takes ~15-25 minutes at MAX_JOBS=4 with
+# TORCH_CUDA_ARCH_LIST=8.9 (L4 only). Default arch list (Ampere + Hopper)
+# would double that. See env var below for arch rationale.
 
 set -euo pipefail
 
@@ -56,8 +57,16 @@ echo "If it hangs, you'll see exactly which file last started compiling."
 echo
 
 cd "$REPO_DIR"
+# TORCH_CUDA_ARCH_LIST=8.9 restricts kernel compilation to Ada Lovelace
+# (L4, RTX 40-series). This is appropriate because:
+#   - The investigation target is L4 (anti-voice prod GPU and this pod GPU)
+#   - The .so is pod-local — never copied to a different machine
+#   - Default arch list is "8.0;9.0" (Ampere + Hopper) which both wastes
+#     compile time AND produces a binary that JITs from PTX on L4 first run
+# If you move to a different GPU class, re-run this script on the new pod.
 MAX_JOBS=4 \
 CUDA_HOME="$CUDA_HOME_VAL" \
+TORCH_CUDA_ARCH_LIST="8.9" \
 FLASH_ATTENTION_FORCE_BUILD=TRUE \
 "$VENV/bin/python" -m pip install -v \
     "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3" \
