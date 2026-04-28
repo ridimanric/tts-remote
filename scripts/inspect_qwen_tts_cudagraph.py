@@ -155,14 +155,18 @@ def main() -> None:
     print(f"  decode-step capture target: '{decode_target_name}' ({decode_target_count} calls)")
     decode_target = dict(inner_model.named_modules())[decode_target_name]
 
-    header("Step 2b: hook the decode-step module to capture realistic inputs")
+    header("Step 2b: pre-hook the decode-step module to capture realistic inputs")
 
-    original_forward = decode_target.forward
-
-    def hooking_forward(*args: Any, **kwargs: Any) -> Any:
+    # We use register_forward_pre_hook with_kwargs=True instead of replacing
+    # decode_target.forward. Replacing forward changes its signature to
+    # (*args, **kwargs), which breaks HF transformers' generation kwargs
+    # validation (it inspects forward's signature to know which kwargs are
+    # valid).
+    def pre_hook(_module: Any, args: tuple, kwargs: dict) -> None:
         global _captured_args, _captured_kwargs, _capture_count
         _capture_count += 1
-        # Capture the SECOND call (skip prefill / first step).
+        # Capture the SECOND call (first is prefill; second is the steady-
+        # state decode step we want to capture).
         if _capture_count == 2 and _captured_args is None:
             def _clone(x: Any) -> Any:
                 if isinstance(x, torch.Tensor):
@@ -182,9 +186,8 @@ def main() -> None:
                 else:
                     print(f"      [{i}] type={type(a).__name__}")
             print(f"    kwargs: {sorted(kwargs.keys())}")
-        return original_forward(*args, **kwargs)
 
-    decode_target.forward = hooking_forward  # type: ignore[method-assign]
+    handle = decode_target.register_forward_pre_hook(pre_hook, with_kwargs=True)
     try:
         print("  running short generate to capture step inputs (max_new_tokens=8)...")
         t0 = time.perf_counter()
@@ -197,11 +200,13 @@ def main() -> None:
         gen_ms = (time.perf_counter() - t0) * 1000
         print(f"  short generate finished in {gen_ms:.0f} ms; total target calls: {_capture_count}")
     finally:
-        decode_target.forward = original_forward  # type: ignore[method-assign]
+        handle.remove()
 
     if _captured_args is None:
-        print("ERROR: hook on decode_target was not invoked. Cannot proceed.")
+        print("ERROR: pre-hook on decode_target was not invoked. Cannot proceed.")
         return
+
+    original_forward = decode_target.forward
 
     header("Step 3: replay one forward eagerly to establish reference output")
     torch.cuda.synchronize()
