@@ -9,11 +9,15 @@
 #
 # Reference: anti-voice/docs/debug-reports/2026-04-20-qwen3-tts-flash-attn-latency.md
 #
+# Why pip -v instead of uv: uv pip install buffers compile output. For a
+# 30-60min build we need to see every nvcc/g++ line live so any stall or
+# error is visible immediately. pip -v streams stdout/stderr in real time.
+#
 # Usage (from /workspace/tts-remote on the pod):
 #     bash scripts/install_flash_attn.sh
 #
-# Runs in the FOREGROUND. Build takes ~25 minutes at MAX_JOBS=4. If your
-# SSH connection might drop, wrap the call yourself in tmux/nohup.
+# Runs in the FOREGROUND. Build takes ~30-60 minutes at MAX_JOBS=4 depending
+# on which kernels are heaviest.
 
 set -euo pipefail
 
@@ -26,9 +30,6 @@ if [ ! -x "$VENV/bin/python" ]; then
 fi
 
 echo "=== locate nvcc ==="
-# RunPod CUDA images already ship nvcc at /usr/local/cuda/bin/nvcc.
-# Ubuntu's nvidia-cuda-toolkit puts it at /usr/bin/nvcc.
-# We auto-detect rather than assume — and fail loudly if neither exists.
 NVCC_PATH="$(command -v nvcc || true)"
 if [ -z "$NVCC_PATH" ]; then
     echo "ERROR: nvcc not found in PATH. Install nvidia-cuda-toolkit:" >&2
@@ -38,19 +39,28 @@ fi
 echo "nvcc: $NVCC_PATH"
 nvcc --version
 
-# CUDA_HOME = parent-of-nvcc's-bin-dir.
 NVCC_BIN_DIR="$(dirname "$NVCC_PATH")"
 CUDA_HOME_VAL="$(dirname "$NVCC_BIN_DIR")"
 echo "CUDA_HOME -> $CUDA_HOME_VAL"
 
 echo
-echo "=== build flash-attn (foreground, ~25 min at MAX_JOBS=4) ==="
+echo "=== ensure pip is available in the venv ==="
+# uv venvs don't include pip by default. Bootstrap it.
+"$VENV/bin/python" -m ensurepip --upgrade 2>/dev/null || true
+"$VENV/bin/python" -m pip --version
+
+echo
+echo "=== build flash-attn (foreground, pip -v streamed, ~30-60 min) ==="
+echo "Each nvcc/g++ command will print as it runs."
+echo "If it hangs, you'll see exactly which file last started compiling."
+echo
+
 cd "$REPO_DIR"
 MAX_JOBS=4 \
 CUDA_HOME="$CUDA_HOME_VAL" \
 FLASH_ATTENTION_FORCE_BUILD=TRUE \
-uv pip install --python "$VENV/bin/python" \
-    "flash-attn @ git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3" \
+"$VENV/bin/python" -m pip install -v \
+    "git+https://github.com/Dao-AILab/flash-attention.git@v2.8.3" \
     --no-build-isolation --no-cache-dir
 
 echo
