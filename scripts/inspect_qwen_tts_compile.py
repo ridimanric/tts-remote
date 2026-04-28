@@ -11,16 +11,23 @@ This script uses `torch._dynamo.explain()` to attempt compilation of the
 underlying transformer's forward pass and report every graph break with
 its reason + source location. Empirical, no source-code grepping.
 
+Compatibility shim: transformers 4.57.3 calls `torch.compiler.is_exporting()`
+which doesn't exist in torch 2.6.0 (added in 2.7+). Without a shim, dynamo
+errors before tracing any model code. We patch it to return a constant
+False (semantically correct — we're not in torch.export() mode here).
+
+The shim COULD theoretically affect graph capture if transformers used
+`is_exporting()` in a way that should sometimes return True. To detect
+this, we install the patched function with a call counter + first-call
+traceback dump. After explain, we print how many times it was invoked
+and warn loudly if invocations occurred — so silent semantic drift
+cannot happen unnoticed.
+
 Run from /workspace/tts-remote:
     .venv/bin/python scripts/inspect_qwen_tts_compile.py
-
-Output sections:
-  1. Model load
-  2. Forward-pass dry run (uncompiled — sanity check)
-  3. dynamo.explain on the model's forward — graph break report
-  4. Summary verdict: clean / minor breaks / fundamentally incompatible
 """
 import time
+import traceback
 from typing import Final
 
 REF_AUDIO: Final[str] = "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-TTS-Repo/clone.wav"
@@ -31,6 +38,31 @@ REF_TEXT: Final[str] = (
 TEST_SENTENCE: Final[str] = "Hello, this is a test of Qwen three TTS latency."
 
 
+# Counter + traceback samples for the is_exporting shim.
+_is_exporting_calls: int = 0
+_is_exporting_first_traceback: str | None = None
+
+
+def _patched_is_exporting() -> bool:
+    """Shim for torch.compiler.is_exporting (missing in torch 2.6)."""
+    global _is_exporting_calls, _is_exporting_first_traceback
+    _is_exporting_calls += 1
+    if _is_exporting_first_traceback is None:
+        # Capture the first call site for diagnostics.
+        _is_exporting_first_traceback = "".join(traceback.format_stack(limit=8))
+    return False
+
+
+def install_compat_shim() -> None:
+    """Install torch.compiler.is_exporting if missing. Tracks calls."""
+    import torch.compiler
+    if hasattr(torch.compiler, "is_exporting"):
+        print("torch.compiler.is_exporting already exists — no shim needed.")
+        return
+    torch.compiler.is_exporting = _patched_is_exporting
+    print("Installed torch.compiler.is_exporting shim (returns False, counts calls).")
+
+
 def header(s: str) -> None:
     print()
     print("=" * 70)
@@ -39,7 +71,10 @@ def header(s: str) -> None:
 
 
 def main() -> None:
+    # Shim must be installed before transformers (or any consumer) imports.
     import torch
+    install_compat_shim()
+
     from qwen_tts import Qwen3TTSModel  # pyright: ignore[reportMissingImports]
     import torch._dynamo as dynamo
 
@@ -59,8 +94,6 @@ def main() -> None:
     print(f"inner model module path: {type(inner_model).__module__}")
 
     header("Step 2: build a synthetic forward-pass input via voice_clone_prompt")
-    # Use the same path the profiler used — pre-extract a prompt, then run a
-    # one-step generate to capture the actual forward signature.
     prompt = model.create_voice_clone_prompt(
         ref_audio=REF_AUDIO,
         ref_text=REF_TEXT,
@@ -68,16 +101,10 @@ def main() -> None:
     print(f"prompt items: {len(prompt)} (used to seed inner-model forward)")
 
     header("Step 3: dynamo.explain on a single forward through generate")
-    # We can't easily isolate a single decoder step without monkey-patching
-    # the transformer's generate loop. Instead, run the FULL generate_voice_clone
-    # under torch._dynamo.explain, which captures graph breaks across the entire
-    # generation. The breaks reported here are the ones torch.compile would
-    # encounter when we wrap the inner model.
     print("Running explain(...) — this will execute one full generation under")
     print("dynamo's analyser. Slower than normal generate; expect ~30-60 s.")
     print()
 
-    # explain() returns an ExplainOutput object with break_reasons, op_count, etc.
     def _generation_call() -> object:
         return model.generate_voice_clone(
             text=TEST_SENTENCE,
@@ -86,20 +113,47 @@ def main() -> None:
         )
 
     t0 = time.perf_counter()
+    explanation: object | None = None
+    explain_error: Exception | None = None
     try:
         explanation = dynamo.explain(_generation_call)()
     except Exception as e:
-        print(f"explain() raised: {type(e).__name__}: {e}")
-        print()
-        print("This usually means a fundamentally non-traceable construct exists")
-        print("(e.g. heavy use of Python control flow that depends on tensor")
-        print("values, or .item() calls in hot paths).")
-        return
+        explain_error = e
     explain_ms = (time.perf_counter() - t0) * 1000
     print(f"explain() finished in {explain_ms:.0f} ms")
 
+    header("Step 3b: shim invocation report")
+    print(f"  torch.compiler.is_exporting was invoked: {_is_exporting_calls} times")
+    if _is_exporting_calls == 0:
+        print("  Shim was never called during explain. Patch is moot — results")
+        print("  are equivalent to running on a torch version with native is_exporting.")
+    else:
+        print()
+        print("  WARNING: shim was invoked. Our patch returns constant False.")
+        print("  This is semantically correct for non-export use cases, but if any")
+        print("  call site expected a different answer, the trace may differ from")
+        print("  what real torch.compile would produce.")
+        print()
+        print("  First invocation traceback:")
+        if _is_exporting_first_traceback:
+            for line in _is_exporting_first_traceback.splitlines():
+                print(f"    {line}")
+        print()
+        print("  Verify: each call site should be control flow that decides between")
+        print("  'real torch.compile path' (False -> our path) and 'torch.export()")
+        print("  path' (True -> not us). If yes, the trace is reliable. If a call")
+        print("  site flips behaviour based on this for compile users specifically,")
+        print("  re-run after upgrading transformers or torch.")
+
+    if explain_error is not None:
+        header("Step 4: explain() raised — cannot produce graph-break report")
+        print(f"  {type(explain_error).__name__}: {explain_error}")
+        print()
+        print("  This is a different failure than the version-mismatch we patched.")
+        print("  Read the error above to diagnose.")
+        return
+
     header("Step 4: graph break report")
-    # ExplainOutput exposes break_reasons (list of GraphCompileReason).
     breaks = getattr(explanation, "break_reasons", []) or []
     op_count = getattr(explanation, "op_count", "?")
     graph_count = getattr(explanation, "graph_count", "?")
@@ -119,7 +173,6 @@ def main() -> None:
             user_stack = getattr(br, "user_stack", None)
             print(f"  [{i}] {reason}")
             if user_stack:
-                # user_stack is typically a list of FrameSummary objects
                 for frame in user_stack[:3]:
                     print(f"        at {frame}")
 
@@ -147,6 +200,10 @@ def main() -> None:
             "and proceeding to Exp 3 (CUDA graphs) per the sequence doc."
         )
     print(f"  {verdict}")
+    if _is_exporting_calls > 0:
+        print()
+        print(f"  CAVEAT: shim was invoked {_is_exporting_calls} times — read")
+        print(f"  step 3b for whether the verdict can be trusted as-is.")
 
 
 if __name__ == "__main__":
