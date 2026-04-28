@@ -45,10 +45,23 @@ CUDA_HOME_VAL="$(dirname "$NVCC_BIN_DIR")"
 echo "CUDA_HOME -> $CUDA_HOME_VAL"
 
 echo
-echo "=== ensure pip is available in the venv ==="
+echo "=== ensure pip + ninja are available in the venv ==="
 # uv venvs don't include pip by default. Bootstrap it.
 "$VENV/bin/python" -m ensurepip --upgrade 2>/dev/null || true
 "$VENV/bin/python" -m pip --version
+
+# ninja must be on PATH for torch.cpp_extension. distutils fallback
+# hangs with parallel CUDA builds — ninja is required, not optional.
+# Install if missing.
+if [ ! -x "$VENV/bin/ninja" ]; then
+    echo "Installing ninja into the venv..."
+    uv pip install --python "$VENV/bin/python" ninja
+fi
+
+# Prepend venv bin to PATH so torch.cpp_extension finds ninja.
+export PATH="$VENV/bin:$PATH"
+echo "ninja: $(command -v ninja)"
+ninja --version
 
 echo
 echo "=== build flash-attn (foreground, pip -v streamed, ~30-60 min) ==="
