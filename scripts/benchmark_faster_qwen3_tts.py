@@ -148,137 +148,121 @@ def main() -> None:
         print(f"    {name}{sig}")
 
     # ------------------------------------------------------------------
-    header("Step 5: synthesis benchmark — default voice (no cloning)")
+    header("Step 5: synthesis benchmark — voice cloning (our prod use case)")
     # ------------------------------------------------------------------
-    # Pick a sensible synthesis function. Most likely 'generate' or 'synthesize'.
-    synth_fn_name = None
-    for preferred in ("generate", "synthesize", "tts", "speak"):
-        if preferred in {n for n, _ in synth_candidates}:
-            synth_fn_name = preferred
-            break
+    # FasterQwen3TTS.generate() raises NotImplementedError for default voice.
+    # Our actual use case in anti-voice prod IS voice cloning (every session
+    # has a primed voice profile), so generate_voice_clone is what we benchmark.
+    # This also exercises the CUDA-graph fast path the same way prod would.
+    import soundfile as sf
+    import numpy as np
 
-    if synth_fn_name is None and synth_candidates:
-        synth_fn_name = synth_candidates[0][0]
-
-    if synth_fn_name is None:
-        print("  ERROR: could not auto-pick a synthesis function. Inspect class manually.")
+    if "generate_voice_clone" not in dir(engine):
+        print("  ERROR: generate_voice_clone not available on engine.")
         return
 
-    print(f"  using engine.{synth_fn_name}(...)")
-    synth_fn = getattr(engine, synth_fn_name)
+    ref_path = REF_AUDIO_LOCAL if os.path.exists(REF_AUDIO_LOCAL) else REF_AUDIO_REMOTE
+    print(f"  ref_audio: {ref_path}")
+    print(f"  ref_text:  {REF_TEXT[:60]}...")
+
+    synth_fn = engine.generate_voice_clone
+
+    def _save_wav(out_obj: Any, path: str) -> None:
+        """Save a synthesizer output (tuple/list/dict/array) as a WAV."""
+        if isinstance(out_obj, tuple) and len(out_obj) >= 2:
+            wav_array, sr = out_obj[0], out_obj[1]
+        elif isinstance(out_obj, dict):
+            wav_array = out_obj.get("wav") or out_obj.get("audio") or out_obj.get("waveform")
+            sr = out_obj.get("sample_rate") or out_obj.get("sr") or 24000
+        else:
+            wav_array = out_obj
+            sr = 24000
+        # generate_voice_clone returns Tuple[list, int] per the signature —
+        # the list contains numpy arrays. Take the first.
+        if isinstance(wav_array, list) and len(wav_array) > 0:
+            wav_array = wav_array[0]
+        if hasattr(wav_array, "cpu"):
+            wav_array = wav_array.cpu().numpy()
+        wav_array = np.asarray(wav_array).squeeze()
+        sf.write(path, wav_array, int(sr))
+        return wav_array, sr
 
     print(f"  warmup runs: {WARMUP_RUNS}")
     for i in range(WARMUP_RUNS):
         try:
             t0 = time.perf_counter()
-            wav_out = synth_fn(TEST_SENTENCE)
+            wav_out = synth_fn(
+                text=TEST_SENTENCE,
+                language="English",
+                ref_audio=ref_path,
+                ref_text=REF_TEXT,
+            )
             dt_ms = (time.perf_counter() - t0) * 1000
             print(f"    warmup {i + 1}: {dt_ms:.0f} ms")
-        except TypeError as e:
-            print(f"    warmup {i + 1}: signature mismatch — {e}")
-            print(f"    Trying with text= keyword:")
-            try:
-                t0 = time.perf_counter()
-                wav_out = synth_fn(text=TEST_SENTENCE)
-                dt_ms = (time.perf_counter() - t0) * 1000
-                print(f"      kwarg form: {dt_ms:.0f} ms")
-            except Exception as e2:
-                print(f"      kwarg form also failed: {e2}")
-                traceback.print_exc()
-                return
         except Exception as e:
-            print(f"    warmup {i + 1} failed: {type(e).__name__}: {e}")
+            print(f"    warmup {i + 1} FAILED: {type(e).__name__}: {e}")
             traceback.print_exc()
             return
 
     print(f"  measured runs: {MEASURED_RUNS}")
     measurements: list[float] = []
+    last_wav_out = None
     for i in range(MEASURED_RUNS):
         try:
             t0 = time.perf_counter()
-            wav_out = synth_fn(TEST_SENTENCE)
+            wav_out = synth_fn(
+                text=TEST_SENTENCE,
+                language="English",
+                ref_audio=ref_path,
+                ref_text=REF_TEXT,
+            )
             dt_ms = (time.perf_counter() - t0) * 1000
             measurements.append(dt_ms)
+            last_wav_out = wav_out
             print(f"    call {i + 1}: {dt_ms:.0f} ms")
         except Exception as e:
-            print(f"    call {i + 1} failed: {type(e).__name__}: {e}")
+            print(f"    call {i + 1} FAILED: {type(e).__name__}: {e}")
             return
 
-    # Save the last output for ear-check
+    # Save the last cloned output for ear-check
     try:
-        import soundfile as sf
-        import numpy as np
-        if isinstance(wav_out, tuple) and len(wav_out) >= 2:
-            wav_array, sr = wav_out[0], wav_out[1]
-        elif isinstance(wav_out, dict):
-            wav_array = wav_out.get("wav") or wav_out.get("audio") or wav_out.get("waveform")
-            sr = wav_out.get("sample_rate") or wav_out.get("sr") or 24000
-        else:
-            wav_array = wav_out
-            sr = 24000
-
-        if hasattr(wav_array, "cpu"):
-            wav_array = wav_array.cpu().numpy()
-        wav_array = np.asarray(wav_array).squeeze()
-        out_path = os.path.join(OUTPUT_DIR, "default_voice.wav")
-        sf.write(out_path, wav_array, int(sr))
-        print(f"  saved output: {out_path} ({len(wav_array)/sr:.2f}s @ {sr}Hz)")
+        out_path = os.path.join(OUTPUT_DIR, "cloned_voice.wav")
+        wav_array, sr = _save_wav(last_wav_out, out_path)
+        print(f"  saved cloned output: {out_path} ({len(wav_array)/sr:.2f}s @ {sr}Hz)")
     except Exception as e:
         print(f"  WAV save failed: {e}")
 
     # ------------------------------------------------------------------
-    header("Step 6: voice cloning test (if supported)")
+    header("Step 6: streaming variant — measure TTFA")
     # ------------------------------------------------------------------
-    # Look for a cloning-capable method or a kwarg pattern.
-    cloning_attempted = False
-    for name, sig in synth_candidates:
-        if not sig:
-            continue
-        params = list(sig.parameters.keys())
-        if any(p in params for p in ("ref_audio", "voice", "speaker_audio", "audio_prompt")):
-            cloning_attempted = True
-            fn = getattr(engine, name)
-            print(f"  trying {name} with ref_audio kwarg...")
-            try:
-                ref_path = REF_AUDIO_LOCAL if os.path.exists(REF_AUDIO_LOCAL) else REF_AUDIO_REMOTE
-                t0 = time.perf_counter()
-                # Try the most likely kwarg names
-                for ref_kwarg in ("ref_audio", "voice", "speaker_audio", "audio_prompt"):
-                    if ref_kwarg in params:
-                        kwargs = {ref_kwarg: ref_path}
-                        if "ref_text" in params:
-                            kwargs["ref_text"] = REF_TEXT
-                        wav_out = fn(TEST_SENTENCE, **kwargs)
-                        break
-                dt_ms = (time.perf_counter() - t0) * 1000
-                print(f"    cloning call: {dt_ms:.0f} ms")
-                # Save the cloned-voice output
-                if isinstance(wav_out, tuple) and len(wav_out) >= 2:
-                    wav_array, sr = wav_out[0], wav_out[1]
-                elif isinstance(wav_out, dict):
-                    wav_array = wav_out.get("wav") or wav_out.get("audio")
-                    sr = wav_out.get("sample_rate") or wav_out.get("sr") or 24000
-                else:
-                    wav_array = wav_out
-                    sr = 24000
-                if hasattr(wav_array, "cpu"):
-                    wav_array = wav_array.cpu().numpy()
-                wav_array = np.asarray(wav_array).squeeze()
-                out_path = os.path.join(OUTPUT_DIR, "cloned_voice.wav")
-                sf.write(out_path, wav_array, int(sr))
-                print(f"    saved cloned output: {out_path}")
-            except Exception as e:
-                print(f"    cloning call failed: {type(e).__name__}: {e}")
-                traceback.print_exc()
-            break
-
-    if not cloning_attempted:
-        print("  no cloning kwarg found in any candidate. Possibilities:")
-        print("    - cloning is via a separate prime/load-voice method")
-        print("    - cloning uses a different mechanism we missed")
-        print("  Inspect manually:")
-        for name, sig in synth_candidates:
-            print(f"    {name}{sig}")
+    # The streaming generator yields chunks. Measure time-to-first-audio
+    # (first chunk yielded) — that's the user-perceived latency for a
+    # voice agent (audio starts playing as soon as first chunk arrives).
+    if "generate_voice_clone_streaming" not in dir(engine):
+        print("  generate_voice_clone_streaming not available; skipping.")
+    else:
+        print("  measuring TTFA via generate_voice_clone_streaming...")
+        stream_fn = engine.generate_voice_clone_streaming
+        try:
+            t0 = time.perf_counter()
+            gen = stream_fn(
+                text=TEST_SENTENCE,
+                language="English",
+                ref_audio=ref_path,
+                ref_text=REF_TEXT,
+            )
+            first_chunk = next(gen)
+            ttfa_ms = (time.perf_counter() - t0) * 1000
+            print(f"    TTFA (time to first audio chunk): {ttfa_ms:.0f} ms")
+            # Drain the rest to get total
+            chunk_count = 1
+            for _ in gen:
+                chunk_count += 1
+            total_ms = (time.perf_counter() - t0) * 1000
+            print(f"    total streaming time: {total_ms:.0f} ms ({chunk_count} chunks)")
+        except Exception as e:
+            print(f"    streaming benchmark failed: {type(e).__name__}: {e}")
+            traceback.print_exc()
 
     # ------------------------------------------------------------------
     header("Step 7: summary")
@@ -286,12 +270,12 @@ def main() -> None:
     if measurements:
         sorted_m = sorted(measurements)
         p50 = sorted_m[len(sorted_m) // 2]
-        print(f"  default-voice synthesis on L4:")
+        print(f"  voice-cloning synthesis on L4 (FasterQwen3TTS):")
         print(f"    per-call ms: {[f'{m:.0f}' for m in measurements]}")
         print(f"    p50: {p50:.0f} ms")
         print(f"    min: {min(measurements):.0f} ms | max: {max(measurements):.0f} ms")
         print()
-        print(f"  vanilla qwen-tts baseline (10s) → {p50:.0f} ms = {(10000 - p50) / 10000 * 100:.0f}% reduction")
+        print(f"  vanilla qwen-tts baseline (10s) → p50 {p50:.0f} ms = {(10000 - p50) / 10000 * 100:.0f}% reduction")
         print(f"  target (700 ms p95): {'PASS' if max(measurements) <= 700 else 'NOT YET'}")
         print()
         print(f"  Output WAVs at {OUTPUT_DIR} for ear-check.")
