@@ -134,25 +134,29 @@ def main() -> None:
     for qualname, count in sorted(call_counts.items(), key=lambda kv: -kv[1])[:20]:
         print(f"  {count:>7d}  {qualname}")
 
-    # The "decode step" forward is typically the highest-level module that runs
-    # exactly once per generated token. With max_new_tokens=8 plus 1 prefill,
-    # we expect ~8-9 calls on the right module.
-    decode_candidates = [name for name, count in call_counts.items() if 7 <= count <= 12]
-    if not decode_candidates:
+    # We need a capture target that:
+    #   1. Sits BELOW transformers' create_causal_mask path (avoids the
+    #      `attention_mask.all()` host-sync that breaks capture).
+    #   2. Has stable inputs across calls (a single decoder layer fits — its
+    #      inputs are hidden_states + already-computed mask + position_ids).
+    #
+    # The first decoder layer of the inner code_predictor model satisfies
+    # both. From the call counts above we expect ~13 calls per outer token.
+    # If this layer can be captured cleanly, we've proven the method works
+    # and can apply it broadly to all layers.
+    decode_target_name = "talker.code_predictor.model.layers.0"
+    if decode_target_name not in dict(inner_model.named_modules()):
         print()
-        print("  WARNING: no module matches expected per-step call count (7-12).")
-        print("  Cannot auto-identify the decode-step module.")
+        print(f"  ERROR: expected target module '{decode_target_name}' not found.")
+        print(f"  Module structure may have changed; inspect call_counts above and")
+        print(f"  pick a layer-level module manually.")
         return
-
-    # Pick the LONGEST qualified name among candidates with the same count —
-    # that's the deepest module that fires per step (closer to the actual decoder).
-    # Actually we want the SHORTEST — that's the highest-level module per-step,
-    # which is a better capture target (encloses the whole step).
-    decode_candidates.sort(key=len)
-    decode_target_name = decode_candidates[0]
-    decode_target_count = call_counts[decode_target_name]
+    decode_target_count = call_counts.get(decode_target_name, 0)
     print()
-    print(f"  decode-step capture target: '{decode_target_name}' ({decode_target_count} calls)")
+    print(f"  decode-step capture target: '{decode_target_name}' ({decode_target_count} calls during 8-token generate)")
+    print(f"  This is a single decoder layer — sits below mask creation, so")
+    print(f"  the `attention_mask.all()` blocker in transformers/masking_utils.py")
+    print(f"  is not in this capture path.")
     decode_target = dict(inner_model.named_modules())[decode_target_name]
 
     header("Step 2b: pre-hook the decode-step module to capture realistic inputs")
