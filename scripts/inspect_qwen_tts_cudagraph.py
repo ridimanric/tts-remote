@@ -232,12 +232,23 @@ def main() -> None:
 
     original_forward = decode_target.forward
 
-    header("Step 3: replay one forward eagerly to establish reference output")
+    # The captured kwargs include past_key_values (a transformers Cache
+    # object). The forward call mutates this Cache in place, so successive
+    # calls see different state. To get a clean apples-to-apples comparison
+    # between eager and captured replay, we deep-copy the captured inputs
+    # before each call so each call starts from the same Cache state.
+    import copy
+
+    def _fresh_inputs() -> tuple[tuple, dict]:
+        return (copy.deepcopy(_captured_args), copy.deepcopy(_captured_kwargs))
+
+    header("Step 3: eager forward to establish reference output (fresh cache)")
     torch.cuda.synchronize()
     with torch.no_grad():
         try:
+            ea, ek = _fresh_inputs()
             t0 = time.perf_counter()
-            ref_output = original_forward(*_captured_args, **_captured_kwargs)
+            ref_output = original_forward(*ea, **ek)
             torch.cuda.synchronize()
             ref_ms = (time.perf_counter() - t0) * 1000
         except Exception as e:
@@ -249,20 +260,23 @@ def main() -> None:
     print(f"  eager output type: {type(ref_output).__name__}")
 
     header("Step 4: attempt CUDA graph capture of one forward call")
-    print("  Running 3 warmup forwards on a side stream (CUDA graph requires this)...")
+    print("  Running 3 warmup forwards on a side stream with FRESH inputs each...")
 
     # CUDA graph capture requires:
     #   1. A separate stream
     #   2. Warmup so cuBLAS/cuDNN kernels have selected their algorithms
-    #   3. Static input addresses (we'll use the captured tensors as the
-    #      static buffers — replay copies new inputs INTO these buffers)
+    #   3. Static input addresses for replay (the capture call's inputs
+    #      become the static buffers)
+    # We use fresh inputs for each warmup so cache state stays consistent
+    # — a real implementation would reset cache state between steps too.
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         with torch.no_grad():
             try:
                 for i in range(3):
-                    _ = original_forward(*_captured_args, **_captured_kwargs)
+                    wa, wk = _fresh_inputs()
+                    _ = original_forward(*wa, **wk)
             except Exception as e:
                 print(f"  ERROR during warmup: {type(e).__name__}: {e}")
                 traceback.print_exc()
@@ -271,14 +285,15 @@ def main() -> None:
     torch.cuda.synchronize()
     print("  warmup done.")
 
-    print("  Capturing graph...")
+    print("  Capturing graph (fresh inputs)...")
+    cap_args, cap_kwargs = _fresh_inputs()
     g = torch.cuda.CUDAGraph()
     capture_error: Exception | None = None
     capture_output: Any = None
     try:
         with torch.cuda.graph(g):
             with torch.no_grad():
-                capture_output = original_forward(*_captured_args, **_captured_kwargs)
+                capture_output = original_forward(*cap_args, **cap_kwargs)
     except Exception as e:
         capture_error = e
 
@@ -356,11 +371,89 @@ def main() -> None:
     else:
         print("  could not extract a tensor from outputs for comparison.")
 
-    header("Step 6: verdict")
-    print(f"  CUDA graph capture is VIABLE for this forward pass.")
-    print(f"  Single-step replay speedup: {speedup:.1f}x vs eager.")
-    print(f"  Next step: implement static-shape KV cache + per-step replay")
-    print(f"  in tts-remote, then re-benchmark with profile_qwen3_tts.py.")
+    layer_speedup = speedup
+    layer_max_diff = (
+        (ref_tensor.float() - cap_tensor.float()).abs().max().item()
+        if ref_tensor is not None and cap_tensor is not None
+        else float("nan")
+    )
+
+    # ------------------------------------------------------------------
+    # Step 7: stateless MLP capture (sanity check)
+    # ------------------------------------------------------------------
+    # The MLP block has no past_key_values, no mask handling — pure
+    # tensor-in, tensor-out. If capture-replay is sound for the MLP,
+    # the CUDA-graph mechanism itself is healthy. Combined with the
+    # cache-aware Step 4-5 above, this gives us two independent signals.
+    header("Step 7: stateless MLP capture (sanity check)")
+    mlp_name = "talker.code_predictor.model.layers.0.mlp"
+    if mlp_name not in dict(inner_model.named_modules()):
+        print(f"  module '{mlp_name}' not found; skipping stateless test.")
+    else:
+        mlp = dict(inner_model.named_modules())[mlp_name]
+        # Construct synthetic input matching the layer's hidden dim.
+        # From Step 2b output we saw hidden shape (1, 1, 1024).
+        synthetic_input = torch.randn(1, 1, 1024, dtype=torch.bfloat16, device="cuda:0")
+
+        with torch.no_grad():
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            mlp_eager_out = mlp(synthetic_input)
+            torch.cuda.synchronize()
+            mlp_eager_ms = (time.perf_counter() - t0) * 1000
+
+        s2 = torch.cuda.Stream()
+        s2.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s2):
+            with torch.no_grad():
+                for _ in range(3):
+                    _ = mlp(synthetic_input)
+        torch.cuda.current_stream().wait_stream(s2)
+        torch.cuda.synchronize()
+
+        g_mlp = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(g_mlp):
+                with torch.no_grad():
+                    mlp_cap_out = mlp(synthetic_input)
+        except Exception as e:
+            print(f"  MLP CAPTURE FAILED: {type(e).__name__}: {e}")
+            print(f"  Stateless capture is broken — fundamental capture issue, not state-related.")
+        else:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            g_mlp.replay()
+            torch.cuda.synchronize()
+            mlp_replay_ms = (time.perf_counter() - t0) * 1000
+
+            mlp_diff = (mlp_eager_out.float() - mlp_cap_out.float()).abs().max().item()
+            mlp_speedup = mlp_eager_ms / mlp_replay_ms if mlp_replay_ms > 0 else float("inf")
+            print(f"  mlp eager:   {mlp_eager_ms:.3f} ms")
+            print(f"  mlp replay:  {mlp_replay_ms:.3f} ms")
+            print(f"  mlp speedup: {mlp_speedup:.1f}x")
+            print(f"  mlp output max abs diff: {mlp_diff:.6f}")
+            if mlp_diff < 1e-3:
+                print(f"  Stateless MLP capture is CORRECT — proves CUDA-graph mechanism")
+                print(f"  is healthy on this stack. Any divergence at the layer level")
+                print(f"  comes from input-state handling, not capture itself.")
+
+    header("Step 8: verdict")
+    print(f"  Layer-level capture (talker.code_predictor.model.layers.0):")
+    print(f"    speedup: {layer_speedup:.1f}x | output max abs diff: {layer_max_diff:.6f}")
+    print()
+    if layer_max_diff < 1e-2:
+        print(f"  Layer-level capture is VIABLE and numerically sound.")
+        print(f"  Next step: implement static-shape KV cache + per-step replay")
+        print(f"  in tts-remote, benchmark with profile_qwen3_tts.py.")
+    else:
+        print(f"  Layer-level capture mechanically works ({layer_speedup:.1f}x speedup) but")
+        print(f"  numerical divergence > 1e-2 even with fresh-cache copies. Possible causes:")
+        print(f"  - Cache deepcopy missing some state (custom Cache class internals)")
+        print(f"  - In-place ops in the layer modifying inputs we didn't copy")
+        print(f"  - Non-deterministic SDPA path differing between eager and captured")
+        print(f"  Compare with Step 7 result above: if MLP capture was clean (<1e-3),")
+        print(f"  the divergence is state-handling (fixable in implementation). If MLP")
+        print(f"  also diverged, the capture mechanism itself is unsound on this stack.")
 
 
 if __name__ == "__main__":
