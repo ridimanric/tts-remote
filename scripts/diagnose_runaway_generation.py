@@ -57,20 +57,27 @@ SENTENCES: Final[list[tuple[int, str]]] = [
     ),
 ]
 
+# max_new_tokens=512 caps runaway audio at ~42 s (model frame rate ~12 Hz).
+# Long enough to fit normal output for our test sentences (250-char ≈ 31 s
+# expected) but short enough that runaway runs finish in ~30 s instead of 75 s.
+MAX_NEW_TOKENS: Final[int] = 512
+
 CONFIGS: Final[list[tuple[str, dict]]] = [
-    ("H1_default", {"do_sample": True, "temperature": 0.9}),
-    ("H2_greedy", {"do_sample": False, "temperature": 1.0}),  # temp ignored when greedy
-    ("H3_upstream_tuned", {"do_sample": True, "temperature": 0.7}),
-    ("H4_low_temp", {"do_sample": True, "temperature": 0.5}),
-    ("H5_rep_penalty", {"do_sample": True, "temperature": 0.9, "repetition_penalty": 1.2}),
+    ("H1_default", {"do_sample": True, "temperature": 0.9, "max_new_tokens": MAX_NEW_TOKENS}),
+    ("H2_greedy", {"do_sample": False, "temperature": 1.0, "max_new_tokens": MAX_NEW_TOKENS}),
+    ("H3_upstream_tuned", {"do_sample": True, "temperature": 0.7, "max_new_tokens": MAX_NEW_TOKENS}),
+    ("H5_rep_penalty", {"do_sample": True, "temperature": 0.9, "repetition_penalty": 1.2, "max_new_tokens": MAX_NEW_TOKENS}),
 ]
 
-RUNS_PER_BUCKET: Final[int] = 10
+RUNS_PER_BUCKET: Final[int] = 3
 WARMUP_RUNS: Final[int] = 1
 
 # Speech rate heuristic: ~8 characters per second for natural English speech.
 # Wide tolerance because reference voice's pace varies.
 CHARS_PER_SEC_EXPECTED: Final[float] = 8.0
+# Audio capacity ceiling at our token cap. Used to detect "model hit
+# max_new_tokens" specifically, not just "audio is unusually long".
+MAX_AUDIO_SECONDS: Final[float] = MAX_NEW_TOKENS / 12.0
 
 CSV_OUT: Final[str] = "/workspace/tts-remote/traces/faster_qwen3_runaway_diagnosis.csv"
 
@@ -87,7 +94,12 @@ def classify_audio_length(char_count: int, audio_seconds: float) -> str:
     if audio_seconds <= 0:
         return "empty"
     expected_seconds = char_count / CHARS_PER_SEC_EXPECTED
-    if audio_seconds > 3.0 * expected_seconds:
+    # "runaway" if either (a) the model hit its hard token cap, OR (b) audio
+    # is more than 2x the expected length. The first condition catches cases
+    # where the cap is close to expected length (e.g. 250-char + 512 tokens).
+    near_cap = audio_seconds >= 0.9 * MAX_AUDIO_SECONDS
+    much_too_long = audio_seconds > 2.0 * expected_seconds
+    if near_cap or much_too_long:
         return "runaway"
     if audio_seconds < 0.5 * expected_seconds:
         return "truncated"
@@ -205,8 +217,7 @@ def main() -> None:
                         cls,
                     ])
                     csv_file.flush()
-                    if (run_idx + 1) % 5 == 0 or run_idx == 0:
-                        print(f"    run {run_idx + 1:>2}: total={total_ms:.0f} ms, audio={audio_secs:.2f}s [{cls}]")
+                    print(f"    run {run_idx + 1:>2}: total={total_ms:.0f} ms, audio={audio_secs:.2f}s [{cls}]")
                 except Exception as e:
                     print(f"    run {run_idx + 1} FAILED: {type(e).__name__}: {e}")
 
