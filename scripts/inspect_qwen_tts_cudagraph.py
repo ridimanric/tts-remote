@@ -56,6 +56,13 @@ _capture_count: int = 0
 
 
 def main() -> None:
+    # CUDA_LAUNCH_BLOCKING=1 makes CUDA error reports synchronous — the
+    # traceback then points at the actual offending op rather than the
+    # next CUDA call after the failure. Essential for diagnosing capture
+    # blockers. Set before importing torch.
+    import os
+    os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+
     import torch
     from qwen_tts import Qwen3TTSModel  # pyright: ignore[reportMissingImports]
 
@@ -63,13 +70,26 @@ def main() -> None:
         print("ERROR: CUDA not available. CUDA-graph capture requires a GPU.")
         return
 
+    # attn_implementation choice:
+    # - "flash_attention_2": prod default, but transformers' wrapper around
+    #   flash-attn has CPU-sync ops (mask.all() in masking_utils.py:558,
+    #   branch logic in modeling_flash_attention_utils.py:632) that break
+    #   CUDA graph capture.
+    # - "sdpa": uses PyTorch's native scaled_dot_product_attention. On
+    #   Ampere+ GPUs (L4 is sm_89), SDPA dispatches to Flash-Attention-2
+    #   kernels internally, so steady-state speed is comparable. Different
+    #   transformers wrapper code path — may avoid the CPU-sync ops.
+    ATTN_IMPL = "sdpa"
+
     header("Step 1: load model")
+    print(f"  attn_implementation = {ATTN_IMPL!r}")
+    print(f"  CUDA_LAUNCH_BLOCKING = {os.environ.get('CUDA_LAUNCH_BLOCKING')}")
     t0 = time.perf_counter()
     model = Qwen3TTSModel.from_pretrained(
         "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         device_map="cuda:0",
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=ATTN_IMPL,
     )
     load_ms = (time.perf_counter() - t0) * 1000
     print(f"Loaded in {load_ms:.0f} ms")
